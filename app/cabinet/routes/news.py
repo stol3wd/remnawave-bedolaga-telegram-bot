@@ -16,7 +16,7 @@ from app.database.crud.news import (
 )
 from app.database.models import NewsArticle, User
 
-from ..dependencies import get_cabinet_db, get_current_cabinet_user
+from ..dependencies import get_cabinet_db, get_current_cabinet_user, get_optional_cabinet_user
 from ..schemas.news import (
     NewsArticleListItem,
     NewsArticleResponse,
@@ -101,7 +101,7 @@ def _article_to_response(article: NewsArticle, *, include_content: bool = True) 
 # NOTE: /categories MUST be declared before /{slug} to avoid route conflict
 @router.get('/categories', response_model=list[str])
 async def list_categories(
-    user: User = Depends(get_current_cabinet_user),
+    user: User | None = Depends(get_optional_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> list[str]:
     """Get list of distinct news categories."""
@@ -117,7 +117,7 @@ async def list_categories(
 
 @router.get('', response_model=NewsListResponse)
 async def list_published_news(
-    user: User = Depends(get_current_cabinet_user),
+    user: User | None = Depends(get_optional_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
     category: str | None = Query(None, max_length=100),
     limit: int = Query(20, ge=1, le=100),
@@ -149,7 +149,7 @@ async def list_published_news(
 @router.get('/{slug}', response_model=NewsArticleResponse)
 async def get_article_by_slug(
     slug: str = Path(..., max_length=_SLUG_MAX_LENGTH, pattern=_SLUG_PATTERN),
-    user: User = Depends(get_current_cabinet_user),
+    user: User | None = Depends(get_optional_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ) -> NewsArticleResponse:
     """Get a single published news article by slug. Increments view count."""
@@ -167,7 +167,7 @@ async def get_article_by_slug(
     response_data = _article_to_response(article, include_content=True)
 
     # Increment views with per-user deduplication (5-min TTL).
-    if _should_count_view(user.id, article.id):
+    if user is not None and _should_count_view(user.id, article.id):
         try:
             new_count = await increment_views(db, article.id)
             response_data['views_count'] = new_count
@@ -175,3 +175,4 @@ async def get_article_by_slug(
             logger.warning('Failed to increment views', article_id=article.id)
 
     return NewsArticleResponse(**response_data)
+
