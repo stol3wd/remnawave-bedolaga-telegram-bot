@@ -276,6 +276,9 @@ class Settings(BaseSettings):
     # drain (не выдавать новые grace-сессии, но завершать уже открытые).
     GRACE_ACCESS_MODE: Literal['false', 'observe', 'true', 'drain'] = 'false'
     GRACE_ACCESS_DURATION_HOURS: int = 72
+    GRACE_ACCESS_EXPIRED_UNTIL_QUOTA: bool = False
+    GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS: str = ''
+    GRACE_ACCESS_EXPIRED_HOST_UUID: str = ''
     GRACE_ACCESS_EXPIRED_SQUAD_UUID: str = ''
     GRACE_ACCESS_LIMITED_SQUAD_UUID: str = ''
     # Внешний сквад для grace-доступа: пусто = сброс в None, 'keep' = сохранять текущий, либо UUID аварийного внешнего сквада

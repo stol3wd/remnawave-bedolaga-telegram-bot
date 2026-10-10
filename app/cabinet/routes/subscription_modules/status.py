@@ -28,6 +28,7 @@ from app.utils.subscription_time import days_left_rounded_up
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from ...schemas.subscription import (
+    FreeAccessResponse,
     ServerInfo,
     SubscriptionStatusResponse,
 )
@@ -115,7 +116,42 @@ async def get_subscription(
     subscription_data = _subscription_to_response(
         subscription, servers, tariff_name, traffic_purchases_data, user=fresh_user
     )
+    from app.services.free_access_service import get_free_access
+
+    subscription_data.free_access = FreeAccessResponse(**await get_free_access(db, subscription))
     return SubscriptionStatusResponse(has_subscription=True, subscription=subscription_data)
+
+
+@router.get('/free-access', response_model=FreeAccessResponse)
+async def free_access_info(
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+    subscription_id: int | None = Query(None),
+) -> FreeAccessResponse:
+    from app.services.free_access_service import get_free_access
+
+    subscription = await resolve_subscription(db, user, subscription_id)
+    if subscription is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'Subscription not found')
+    return FreeAccessResponse(**await get_free_access(db, subscription))
+
+
+@router.post('/free-access', response_model=FreeAccessResponse)
+async def claim_free_access(
+    user: User = Depends(get_current_cabinet_user),
+    db: AsyncSession = Depends(get_cabinet_db),
+    subscription_id: int | None = Query(None),
+) -> FreeAccessResponse:
+    from app.services.grace_access_runtime import grace_access_runtime
+    from app.services.grace_access_service import GraceReason
+
+    subscription = await resolve_subscription(db, user, subscription_id)
+    if subscription is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, 'Subscription not found')
+    if not settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA:
+        raise HTTPException(status.HTTP_409_CONFLICT, 'Free access is not enabled')
+    await grace_access_runtime.consider_candidate(subscription.id, GraceReason.EXPIRED, source='cabinet')
+    return await free_access_info(user=user, db=db, subscription_id=subscription.id)
 
 
 # ============ Connection Link ============

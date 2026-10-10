@@ -2924,7 +2924,7 @@ class GraceAccessSessionModel(Base):
             (
                 state = 'completed'
                 AND completion_reason IS NOT NULL
-                AND completion_reason IN ('paid', 'timeout', 'drained', 'conflict', 'revoked')
+                AND completion_reason IN ('paid', 'timeout', 'drained', 'conflict', 'revoked', 'quota_exhausted')
                 AND completed_at IS NOT NULL
             )
             OR
@@ -2937,7 +2937,7 @@ class GraceAccessSessionModel(Base):
             name='ck_grace_access_sessions_completion',
         ),
         CheckConstraint(
-            'grace_until > started_at',
+            'grace_until IS NULL OR grace_until > started_at',
             name='ck_grace_access_sessions_dates',
         ),
         CheckConstraint(
@@ -2982,7 +2982,7 @@ class GraceAccessSessionModel(Base):
     overlay = Column(JSON, nullable=False)
 
     started_at = Column(AwareDateTime(), nullable=False)
-    grace_until = Column(AwareDateTime(), nullable=False)
+    grace_until = Column(AwareDateTime(), nullable=True)
     updated_at = Column(AwareDateTime(), nullable=False)
     completion_reason = Column(String(16), nullable=True)
     completed_at = Column(AwareDateTime(), nullable=True)

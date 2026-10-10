@@ -83,6 +83,7 @@ def _build_subscriptions_keyboard(
 ) -> types.InlineKeyboardMarkup:
     """Build inline keyboard with per-subscription management buttons."""
     buttons = []
+
     for idx, sub in enumerate(subscriptions, 1):
         tariff_name = sub.tariff.name if sub.tariff else f'Подписка #{sub.id}'
         buttons.append(
@@ -133,6 +134,22 @@ def _build_subscription_detail_keyboard(sub_id: int, sub=None) -> types.InlineKe
     is_inactive = sub is not None and sub.actual_status in ('expired', 'disabled')
 
     buttons = []
+    if (
+        sub is not None
+        and sub.actual_status == 'expired'
+        and settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA
+        and set(sub.connected_squads or []).intersection(
+            item.strip() for item in settings.GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS.split(',')
+        )
+    ):
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text='🛟 Бесплатный конфиг',
+                    callback_data=f'free_access_connect:{sub_id}',
+                )
+            ]
+        )
 
     if not is_inactive:
         buttons.append([types.InlineKeyboardButton(text='🔗 Ссылка подключения', callback_data=f'sl:{sub_id}')])

@@ -23,6 +23,10 @@ from app.external.remnawave_errors import RemnaWaveAPIError, RemnaWaveInvalidUse
 logger = structlog.get_logger(__name__)
 
 
+class RemnaWaveFreeHostError(RemnaWaveAPIError):
+    """The configured host cannot serve this squad (not a transient node outage)."""
+
+
 class UserStatus(Enum):
     ACTIVE = 'ACTIVE'
     DISABLED = 'DISABLED'
@@ -432,6 +436,7 @@ class RemnaWaveAPI:
     _happ_encrypt_unavailable: bool = False
     _happ_api_disabled_until: float = 0.0
     _happ_api_cache: ClassVar[dict[str, str]] = {}
+    _free_host_checks: ClassVar[dict[tuple[str, str, str], tuple[float, str | None]]] = {}
     _happ_api_failed_urls: ClassVar[set[str]] = set()
     _happ_local_cache: ClassVar[dict[str, str]] = {}
     # Момент (monotonic), до которого все запросы процесса ждут после 429.
@@ -799,6 +804,91 @@ class RemnaWaveAPI:
             if e.status_code == 404:
                 return None
             raise
+
+    async def get_user_metadata(self, user_id: int) -> dict[str, Any]:
+        try:
+            response = await self._make_request('GET', f'/api/metadata/user/{coerce_panel_user_id(user_id)}')
+        except RemnaWaveAPIError as error:
+            if error.status_code == 404:
+                return {}
+            raise
+        metadata = response.get('response', {}).get('metadata')
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise RemnaWaveAPIError('Panel user metadata must be an object')
+        return metadata
+
+    async def update_user_metadata(self, user_id: int, metadata: dict[str, Any], *, expected: dict[str, Any]) -> None:
+        await self._make_request(
+            'PUT',
+            f'/api/metadata/user/{coerce_panel_user_id(user_id)}',
+            {'metadata': metadata, 'expectedMetadata': expected},
+        )
+
+    async def validate_free_access_host(
+        self, host_uuid: str, squad_uuid: str, *, require_connected: bool = True
+    ) -> None:
+        # Reconciliation shares one host across subscribers; validate grants freshly.
+        key = (self.base_url, host_uuid, squad_uuid)
+        cached = self._free_host_checks.get(key) if not require_connected else None
+        if cached and cached[0] > time.monotonic():
+            if cached[1] is not None:
+                raise RemnaWaveFreeHostError(cached[1])
+            return
+        if len(self._free_host_checks) >= 128:
+            self._free_host_checks.clear()
+        try:
+            await self._validate_free_access_host(host_uuid, squad_uuid, require_connected=require_connected)
+        except RemnaWaveAPIError as error:
+            if require_connected or (not isinstance(error, RemnaWaveFreeHostError) and error.status_code != 404):
+                raise
+            self._free_host_checks[key] = (time.monotonic() + 30, str(error))
+            raise RemnaWaveFreeHostError(str(error)) from error
+        if not require_connected:
+            self._free_host_checks[key] = (time.monotonic() + 30, None)
+
+    async def _validate_free_access_host(self, host_uuid: str, squad_uuid: str, *, require_connected: bool) -> None:
+        """Require an enabled VLESS host on an inbound accessible on a connected node."""
+        response = await self._make_request('GET', f'/api/hosts/{host_uuid}')
+        host = response['response']
+        inbound = host.get('inbound') or {}
+        inbound_uuid = inbound.get('configProfileInboundUuid')
+        profile_uuid = inbound.get('configProfileUuid')
+        if host.get('isDisabled') or host.get('isHidden') or not inbound_uuid or not profile_uuid:
+            raise RemnaWaveFreeHostError('Free access host is disabled, hidden or has no inbound')
+        squad = (await self._make_request('GET', f'/api/internal-squads/{squad_uuid}'))['response']
+        if {item['uuid'] for item in squad.get('inbounds', [])} != {inbound_uuid}:
+            raise RemnaWaveFreeHostError('The free internal squad must contain only the configured host inbound')
+        profile = (await self._make_request('GET', f'/api/config-profiles/{profile_uuid}'))['response']
+        inbound_tag = next(entry.get('tag') for entry in squad['inbounds'] if entry['uuid'] == inbound_uuid)
+        raw_inbound = next(
+            (item for item in (profile.get('config') or {}).get('inbounds', []) if item.get('tag') == inbound_tag),
+            None,
+        )
+        if not raw_inbound or raw_inbound.get('protocol') != 'vless':
+            raise RemnaWaveFreeHostError('Free access requires a VLESS inbound')
+        nodes = (await self._make_request('GET', f'/api/internal-squads/{squad_uuid}/accessible-nodes'))['response']
+        live_nodes = {
+            node.uuid
+            for node in await self.get_all_nodes()
+            if not node.is_disabled and (node.is_connected or not require_connected)
+        }
+        host_nodes = set(host.get('nodes', []))
+        host_squads = host.get('internalSquads') or {}
+        squads = set(host_squads.get('squads', []))
+        if (host_squads.get('mode') == 'ALLOW_ONLY' and squad_uuid not in squads) or (
+            host_squads.get('mode') == 'EXCLUDE' and squad_uuid in squads
+        ):
+            raise RemnaWaveFreeHostError('Free access host excludes the free internal squad')
+        if not any(
+            node['uuid'] in live_nodes
+            and (not host_nodes or node['uuid'] in host_nodes)
+            and node.get('configProfileUuid') == profile_uuid
+            and inbound_tag in node.get('activeInbounds', [])
+            for node in nodes.get('accessibleNodes', [])
+        ):
+            raise RemnaWaveFreeHostError('Free access host inbound is not active on an available node')
 
     async def get_user_by_short_uuid(self, short_uuid: str) -> RemnaWaveUser | None:
         """``GET /api/users/by-short-uuid/{shortUuid}`` — сохранился в 3.0.0.

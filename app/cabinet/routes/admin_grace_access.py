@@ -44,6 +44,9 @@ router = APIRouter(prefix='/admin/grace-access', tags=['Admin Grace Access'])
 FIELD_KEYS: dict[str, str] = {
     'mode': 'GRACE_ACCESS_MODE',
     'duration_hours': 'GRACE_ACCESS_DURATION_HOURS',
+    'expired_until_quota': 'GRACE_ACCESS_EXPIRED_UNTIL_QUOTA',
+    'expired_eligible_squad_uuids': 'GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS',
+    'expired_host_uuid': 'GRACE_ACCESS_EXPIRED_HOST_UUID',
     'expired_squad_uuid': 'GRACE_ACCESS_EXPIRED_SQUAD_UUID',
     'limited_squad_uuid': 'GRACE_ACCESS_LIMITED_SQUAD_UUID',
     'external_squad_uuid': 'GRACE_ACCESS_EXTERNAL_SQUAD_UUID',
@@ -102,6 +105,9 @@ class GraceAccessConfig(BaseModel):
 
     mode: str
     duration_hours: int
+    expired_until_quota: bool = False
+    expired_eligible_squad_uuids: str = ''
+    expired_host_uuid: str = ''
     expired_squad_uuid: str
     limited_squad_uuid: str
     external_squad_uuid: str
@@ -172,6 +178,9 @@ class GraceAccessUpdate(BaseModel):
 
     mode: Literal['false', 'observe', 'true', 'drain'] | None = None
     duration_hours: int | None = Field(default=None, ge=1, le=8760)
+    expired_until_quota: bool | None = None
+    expired_eligible_squad_uuids: str | None = Field(default=None, max_length=4096)
+    expired_host_uuid: str | None = None
     expired_squad_uuid: str | None = None
     limited_squad_uuid: str | None = None
     external_squad_uuid: str | None = None
@@ -202,7 +211,7 @@ class GraceSessionItem(BaseModel):
     reason: str
     state: str
     started_at: datetime
-    grace_until: datetime
+    grace_until: datetime | None
     updated_at: datetime
     completion_reason: str | None = None
     last_error: str | None = None
@@ -299,12 +308,20 @@ def _collect_issues(config: GraceAccessConfig, *, open_sessions: int, running_mo
 
     for field in ('expired_squad_uuid', 'limited_squad_uuid'):
         raw = _normalize_squad(getattr(config, field))
+        if field == 'limited_squad_uuid' and not raw and config.expired_until_quota:
+            continue
         if not raw:
             issues.append(GraceAccessIssue(field=field, code='squad_required', severity=weight))
         elif not _is_uuid(raw):
             issues.append(GraceAccessIssue(field=field, code='squad_invalid', severity=weight))
 
     external = _normalize_squad(config.external_squad_uuid)
+    if config.expired_until_quota:
+        if not _is_uuid(config.expired_host_uuid.strip()):
+            issues.append(GraceAccessIssue(field='expired_host_uuid', code='squad_invalid', severity=weight))
+        eligible = [item.strip() for item in config.expired_eligible_squad_uuids.split(',') if item.strip()]
+        if not eligible or any(not _is_uuid(item) for item in eligible):
+            issues.append(GraceAccessIssue(field='expired_eligible_squad_uuids', code='squad_invalid', severity=weight))
     if external and external.lower() != EXTERNAL_SQUAD_KEEP and not _is_uuid(external):
         issues.append(GraceAccessIssue(field='external_squad_uuid', code='squad_invalid', severity=weight))
 

@@ -14,7 +14,10 @@ Grace-доступ временно оставляет клиенту тольк
 - `GRACE_ACCESS_MODE=true` — выдаются новые grace-сессии и обрабатываются уже открытые.
 - `GRACE_ACCESS_MODE=drain` — новые grace-сессии не выдаются. Уже активные корректно завершаются по оплате или своему исходному сроку; незавершённый `pending` не активируется.
 
-Allowlist не используется.
+В обычном режиме allowlist не используется. В новом режиме `GRACE_ACCESS_EXPIRED_UNTIL_QUOTA=true`
+истёкшая подписка получает разовую квоту без срока только при принадлежности её исходных
+платных групп к `GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS`. Подробности настройки и переноса
+с VPS: [FREE_ACCESS_FORK_GUIDE_RU.md](FREE_ACCESS_FORK_GUIDE_RU.md).
 
 ## Настройки
 

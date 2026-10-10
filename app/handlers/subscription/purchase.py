@@ -4316,6 +4316,7 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_happ_download_back, F.data == 'happ_download_back')
 
     dp.callback_query.register(handle_connect_subscription, F.data.startswith('subscription_connect'))
+    dp.callback_query.register(handle_connect_subscription, F.data.startswith('free_access_connect'))
 
     dp.callback_query.register(handle_device_guide, F.data.startswith('device_guide_'))
 

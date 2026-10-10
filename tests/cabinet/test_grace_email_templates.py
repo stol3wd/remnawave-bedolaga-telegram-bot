@@ -71,6 +71,17 @@ def test_ended_email_says_access_is_closed():
     assert 'closed' in template['body_html'] and 'Telegram и личный кабинет' in template['body_html']
 
 
+def test_quota_email_has_no_time_deadline_and_escapes_operator_copy():
+    template = EmailNotificationTemplates().get_template(
+        NotificationType.GRACE_ACCESS_GRANTED,
+        'ru',
+        {**CONTEXT, 'hours': 0, 'allowed': '<script>bad</script>'},
+    )
+    assert 'до расходования квоты' in template['body_html']
+    assert '<script>bad</script>' not in template['body_html']
+    assert '&lt;script&gt;bad&lt;/script&gt;' in template['body_html']
+
+
 @pytest.mark.parametrize('event', ['granted', 'ended'])
 @pytest.mark.parametrize('language', ['ru', 'en', 'zh', 'ua'])
 def test_operator_phrase_stands_in_a_case_neutral_slot_in_email(event, language):

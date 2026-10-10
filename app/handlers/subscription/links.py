@@ -74,6 +74,19 @@ async def handle_connect_subscription(
     subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
         return
+    if callback.data.startswith('free_access_connect'):
+        from app.services.free_access_service import get_free_access
+        from app.services.grace_access_runtime import grace_access_runtime
+        from app.services.grace_access_service import GraceReason
+
+        if not settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA:
+            await callback.answer('Бесплатный доступ отключён', show_alert=True)
+            return
+        await grace_access_runtime.consider_candidate(subscription.id, GraceReason.EXPIRED, source='telegram')
+        access = await get_free_access(db, subscription)
+        if not access['active']:
+            await callback.answer('Бесплатный доступ недоступен или квота израсходована', show_alert=True)
+            return
     subscription_link = get_display_subscription_link(subscription)
     hide_subscription_link = settings.should_hide_subscription_link()
     back_cb = f'sm:{sub_id}' if settings.is_multi_tariff_enabled() else 'menu_subscription'

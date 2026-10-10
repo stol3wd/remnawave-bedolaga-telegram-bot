@@ -1758,7 +1758,7 @@ class AdminNotificationService:
         subscription: Subscription,
         tariff_name: str | None,
         reason: str,
-        grace_until: datetime,
+        grace_until: datetime | None,
         hours: int,
         quota_gb: float,
         allowed: str,
@@ -1782,7 +1782,8 @@ class AdminNotificationService:
                 subscription_line += f' «{html.escape(tariff_name)}»'
             reason_line = 'исчерпан трафик' if reason == 'limited' else 'срок подписки истёк'
             quota_text = f'{quota_gb:g} ГБ'
-            until_text = format_local_datetime(grace_until, '%d.%m.%Y %H:%M')
+            until_text = format_local_datetime(grace_until, '%d.%m.%Y %H:%M') if grace_until else 'расходования квоты'
+            duration_text = f'на {hours} ч.' if grace_until else 'без срока'
 
             if event == 'granted':
                 message = f"""🛟 <b>GRACE-ДОСТУП ВЫДАН</b>
@@ -1793,7 +1794,7 @@ class AdminNotificationService:
 
 📋 <b>Подписка:</b> {subscription_line}
 ⚠️ <b>Почему:</b> {reason_line}
-🛟 <b>Что выдано:</b> {allowed}, {quota_text} на {hours} ч.
+🛟 <b>Что выдано:</b> {allowed}, {quota_text} {duration_text}
 ⏳ <b>Действует до:</b> {until_text}
 
 ⏰ <i>{format_local_datetime(datetime.now(UTC), '%d.%m.%Y %H:%M:%S')}</i>"""
@@ -1801,6 +1802,7 @@ class AdminNotificationService:
                 outcomes = {
                     'paid': '✅ человек продлил подписку — вернули обычный тариф',
                     'timeout': '⌛ срок grace вышел, подписку не продлили — доступ закрыт',
+                    'quota_exhausted': '📊 бесплатная квота израсходована — доступ закрыт',
                     'drained': '🚰 grace выключают (слив) — доступ закрыт',
                     'revoked': '🚫 отозван: пользователь заблокирован или подписка отключена',
                     'conflict': '⚠️ конфликт с панелью — доступ закрыт',

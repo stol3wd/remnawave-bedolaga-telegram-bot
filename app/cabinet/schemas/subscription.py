@@ -24,6 +24,15 @@ class TrafficPurchaseInfo(BaseModel):
     progress_percent: float
 
 
+class FreeAccessResponse(BaseModel):
+    active: bool = False
+    eligible: bool = False
+    quota_bytes: int = 0
+    remaining_bytes: int = 0
+    subscription_url: str | None = None
+    reason: str | None = None
+
+
 class SubscriptionData(BaseModel):
     """User subscription data."""
 
@@ -61,6 +70,7 @@ class SubscriptionData(BaseModel):
     # Старая подписка (платная, без тарифа при включённых тарифах): продления
     # и автоплатежа нет, единственный путь — выбрать тариф, он надевается на неё же.
     requires_tariff_selection: bool = False
+    free_access: FreeAccessResponse | None = None
 
     class Config:
         from_attributes = True

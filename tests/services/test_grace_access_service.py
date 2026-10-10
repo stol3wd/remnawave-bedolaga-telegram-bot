@@ -133,6 +133,17 @@ class FakePanelGateway:
             external_squad_uuid=overlay.external_squad_uuid,
             traffic_is_known=self.snapshot.traffic_is_known,
             last_traffic_reset_at=self.snapshot.last_traffic_reset_at,
+            traffic_limit_strategy=overlay.traffic_limit_strategy or self.snapshot.traffic_limit_strategy,
+            selected_hosts_metadata=(
+                {'selectedHosts': [overlay.host_uuid]} if overlay.host_uuid else self.snapshot.selected_hosts_metadata
+            ),
+        )
+
+    async def restore_access_settings(self, remnawave_id, snapshot, overlay, billing) -> None:
+        self.snapshot = replace(
+            self.snapshot,
+            traffic_limit_strategy=snapshot.traffic_limit_strategy,
+            selected_hosts_metadata=snapshot.selected_hosts_metadata,
         )
 
     async def restore_snapshot(
@@ -222,6 +233,131 @@ def make_policy(**changes) -> GraceAccessPolicy:
         traffic_bytes=GIB,
     )
     return replace(policy, **changes)
+
+
+def quota_policy(**changes) -> GraceAccessPolicy:
+    return make_policy(
+        expired_until_quota=True,
+        expired_eligible_squad_uuids=(REGULAR_SQUAD,),
+        expired_host_uuid='44444444-4444-4444-4444-444444444444',
+        limited_squad_uuid='',
+        **changes,
+    )
+
+
+def test_quota_eligibility_requires_original_paid_squad_and_disables_limited() -> None:
+    billing = make_billing(status='expired', end_at=datetime(2026, 7, 15, tzinfo=UTC))
+    assert billing_is_eligible(billing, GraceReason.EXPIRED, quota_policy())
+    assert not billing_is_eligible(replace(billing, squad_uuids=(EXPIRED_SQUAD,)), GraceReason.EXPIRED, quota_policy())
+    assert not billing_is_eligible(replace(billing, status='limited'), GraceReason.LIMITED, quota_policy())
+    with pytest.raises(ValueError, match='Free access requires'):
+        make_policy(expired_until_quota=True)
+
+
+@pytest.mark.asyncio
+async def test_quota_survives_restart_and_time_then_exhausts_once() -> None:
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    clock = MutableClock(now)
+    billing = make_billing(status='expired', end_at=now - timedelta(days=1))
+    snapshot = replace(
+        make_snapshot(expire_at=billing.end_at),
+        status='EXPIRED',
+        traffic_limit_strategy='MONTH',
+        selected_hosts_metadata={'selectedHosts': [REGULAR_SQUAD]},
+    )
+    service, store, panel, billing_gateway = make_service(
+        billing=billing,
+        snapshot=snapshot,
+        clock=clock,
+        policy=quota_policy(reset_traffic_on_start=True),
+    )
+    result = await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    assert result.decision is GraceStartDecision.STARTED
+    assert store.only_session().grace_until is None
+    assert not store.only_session().overlay.reset_used_traffic
+    assert panel.snapshot.used_traffic_bytes == snapshot.used_traffic_bytes
+    assert panel.snapshot.traffic_limit_bytes == snapshot.used_traffic_bytes + GIB
+    assert panel.snapshot.traffic_limit_strategy == 'NO_RESET'
+    clock.advance(timedelta(days=400))
+    restarted = GraceAccessService(
+        store=store, panel=panel, billing=billing_gateway, policy=quota_policy(), clock=clock
+    )
+    assert (await restarted.reconcile()).unchanged == 1
+    panel.snapshot = replace(panel.snapshot, used_traffic_bytes=panel.snapshot.traffic_limit_bytes, status='LIMITED')
+    assert (await restarted.reconcile()).quota_exhausted == 1
+    assert store.only_session().completion_reason is GraceCompletionReason.QUOTA_EXHAUSTED
+    assert panel.snapshot.traffic_limit_strategy == 'MONTH'
+    assert panel.snapshot.used_traffic_bytes == snapshot.used_traffic_bytes + GIB
+    assert (
+        await restarted.start_if_eligible(billing, GraceReason.EXPIRED)
+    ).decision is GraceStartDecision.ALREADY_GRANTED
+    assert billing_gateway.state == billing
+
+
+@pytest.mark.asyncio
+async def test_quota_counter_reset_closes_session_without_refilling() -> None:
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    billing = make_billing(status='expired', end_at=now - timedelta(days=1))
+    service, store, panel, _ = make_service(
+        billing=billing,
+        snapshot=replace(make_snapshot(expire_at=billing.end_at), status='EXPIRED'),
+        clock=MutableClock(now),
+        policy=quota_policy(),
+    )
+    await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    panel.snapshot = replace(panel.snapshot, used_traffic_bytes=0)
+    assert (await service.reconcile()).conflicts == 1
+    assert store.only_session().state is GraceSessionState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_quota_reset_is_detected_even_with_zero_initial_usage():
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    billing = make_billing(status='expired', end_at=now - timedelta(days=1))
+    snapshot = replace(make_snapshot(expire_at=billing.end_at), status='EXPIRED', used_traffic_bytes=0)
+    service, store, panel, _ = make_service(
+        billing=billing, snapshot=snapshot, clock=MutableClock(now), policy=quota_policy()
+    )
+    await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    panel.snapshot = replace(panel.snapshot, used_traffic_bytes=0, last_traffic_reset_at=now + timedelta(seconds=1))
+    assert (await service.reconcile()).conflicts == 1
+    assert store.only_session().state is GraceSessionState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_payment_during_quota_restores_paid_access() -> None:
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    billing = make_billing(status='expired', end_at=now - timedelta(days=1))
+    service, store, panel, gateway = make_service(
+        billing=billing,
+        snapshot=replace(make_snapshot(expire_at=billing.end_at), status='EXPIRED'),
+        clock=MutableClock(now),
+        policy=quota_policy(),
+    )
+    await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    gateway.state = replace(billing, status='active', end_at=now + timedelta(days=30))
+    assert (await service.reconcile()).paid == 1
+    assert store.only_session().completion_reason is GraceCompletionReason.PAID
+    assert panel.applied_billing[-1].squad_uuids == (REGULAR_SQUAD,)
+
+
+@pytest.mark.asyncio
+async def test_quota_does_not_override_disable_and_missing_host_closes_access():
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    billing = make_billing(status='expired', end_at=now - timedelta(days=1))
+    service, store, panel, _ = make_service(
+        billing=billing,
+        snapshot=make_snapshot(expire_at=billing.end_at),
+        clock=MutableClock(now),
+        policy=quota_policy(),
+    )
+    result = await service.start_if_eligible(billing, GraceReason.EXPIRED)
+    assert result.decision is not GraceStartDecision.STARTED
+    panel.snapshot = replace(panel.snapshot, status='EXPIRED')
+    assert (await service.start_if_eligible(billing, GraceReason.EXPIRED)).decision is GraceStartDecision.STARTED
+    panel.snapshot = replace(panel.snapshot, host_available=False)
+    assert (await service.reconcile()).conflicts == 1
+    assert store.only_session().state is GraceSessionState.COMPLETED
 
 
 def make_service(

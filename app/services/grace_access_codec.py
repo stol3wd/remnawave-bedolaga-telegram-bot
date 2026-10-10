@@ -33,14 +33,14 @@ from app.services.grace_access_service import (
 
 logger = structlog.get_logger(__name__)
 
-_SNAPSHOT_VERSION = 3
+_SNAPSHOT_VERSION = 4
 # Version 3 stores the numeric Remnawave 3.0.0 identity.  Version 2 rows are
 # still read: the backfill adds the numeric key *next to* the historical uuid
 # instead of replacing it, and a session that predates the panel upgrade must
 # stay reconcilable.  Refusing v2 here would make `_model_to_session` raise for
 # every such row, `list_open` would drop them from the batch, and their overlay
 # would never be rolled back — a permanently open door with no error report.
-_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({2, _SNAPSHOT_VERSION})
+_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({2, 3, _SNAPSHOT_VERSION})
 
 
 class GraceSnapshotError(ValueError):
@@ -77,7 +77,7 @@ def _session_values(session: GraceAccessSession) -> dict[str, Any]:
         'panel_before': _panel_to_json(session.panel_before),
         'overlay': _overlay_to_json(session.overlay),
         'started_at': _as_utc(session.started_at),
-        'grace_until': _as_utc(session.grace_until),
+        'grace_until': _as_utc(session.grace_until) if session.grace_until else None,
         'updated_at': _as_utc(session.updated_at),
         'completion_reason': session.completion_reason.value if session.completion_reason else None,
         'completed_at': _as_utc(session.completed_at) if session.completed_at else None,
@@ -93,6 +93,9 @@ def _model_to_session(model: GraceAccessSessionModel) -> GraceAccessSession:
     # is a data fault — never "the panel user is gone" — so it surfaces as a
     # snapshot error with last_error instead of a silent restore-less close.
     remnawave_id = _panel_user_id(model.remnawave_id, 'grace_access_sessions.remnawave_id')
+    overlay = _overlay_from_json(model.overlay)
+    if model.grace_until is None and not overlay.until_quota:
+        raise GraceSnapshotError('A grace session without a deadline must be a quota session')
     return GraceAccessSession(
         id=model.id,
         subscription_id=model.subscription_id,
@@ -102,9 +105,9 @@ def _model_to_session(model: GraceAccessSessionModel) -> GraceAccessSession:
         state=GraceSessionState(model.state),
         billing_before=_billing_from_json(model.billing_before),
         panel_before=_panel_from_json(model.panel_before, fallback_remnawave_id=remnawave_id),
-        overlay=_overlay_from_json(model.overlay),
+        overlay=overlay,
         started_at=_as_utc(model.started_at),
-        grace_until=_as_utc(model.grace_until),
+        grace_until=_as_utc(model.grace_until) if model.grace_until else None,
         updated_at=_as_utc(model.updated_at),
         completion_reason=(GraceCompletionReason(model.completion_reason) if model.completion_reason else None),
         completed_at=_as_utc(model.completed_at) if model.completed_at else None,
@@ -129,6 +132,7 @@ def _billing_to_json(value: GraceBillingState) -> dict[str, Any]:
         'is_free_tariff': value.is_free_tariff,
         'user_status': value.user_status,
         'grace_suppressed_until': _datetime_to_json(value.grace_suppressed_until),
+        'traffic_limit_strategy': value.traffic_limit_strategy,
     }
 
 
@@ -151,6 +155,7 @@ def _billing_from_json(raw: Any) -> GraceBillingState:
         is_free_tariff=bool(data.get('is_free_tariff', False)),
         user_status=str(data.get('user_status', 'active')),
         grace_suppressed_until=_datetime_from_json(data.get('grace_suppressed_until')),
+        traffic_limit_strategy=_optional_string(data.get('traffic_limit_strategy')),
     )
 
 
@@ -165,6 +170,8 @@ def _panel_to_json(value: GracePanelSnapshot) -> dict[str, Any]:
         'external_squad_uuid': value.external_squad_uuid,
         'traffic_is_known': value.traffic_is_known,
         'last_traffic_reset_at': _datetime_to_json(value.last_traffic_reset_at),
+        'traffic_limit_strategy': value.traffic_limit_strategy,
+        'selected_hosts_metadata': value.selected_hosts_metadata,
     }
 
 
@@ -186,6 +193,12 @@ def _panel_from_json(raw: Any, *, fallback_remnawave_id: int | None = None) -> G
         external_squad_uuid=_optional_string(data.get('external_squad_uuid')),
         traffic_is_known=bool(data.get('traffic_is_known', True)),
         last_traffic_reset_at=_datetime_from_json(data.get('last_traffic_reset_at')),
+        traffic_limit_strategy=_optional_string(data.get('traffic_limit_strategy')),
+        selected_hosts_metadata=(
+            dict(_mapping(data['selected_hosts_metadata'], 'selected_hosts_metadata'))
+            if data.get('selected_hosts_metadata') is not None
+            else None
+        ),
     )
 
 
@@ -197,6 +210,10 @@ def _overlay_to_json(value: GracePanelOverlay) -> dict[str, Any]:
         'squad_uuids': list(value.squad_uuids),
         'external_squad_uuid': value.external_squad_uuid,
         'reset_used_traffic': value.reset_used_traffic,
+        'until_quota': value.until_quota,
+        'restore_reason': value.restore_reason,
+        'host_uuid': value.host_uuid,
+        'traffic_limit_strategy': value.traffic_limit_strategy,
     }
 
 
@@ -213,6 +230,10 @@ def _overlay_from_json(raw: Any) -> GracePanelOverlay:
         external_squad_uuid=_optional_string(data.get('external_squad_uuid')),
         # Сессии, записанные до появления настройки, счётчик не обнуляли.
         reset_used_traffic=bool(data.get('reset_used_traffic', False)),
+        until_quota=bool(data.get('until_quota', False)),
+        restore_reason=_optional_string(data.get('restore_reason')),
+        host_uuid=_optional_string(data.get('host_uuid')),
+        traffic_limit_strategy=_optional_string(data.get('traffic_limit_strategy')),
     )
 
 

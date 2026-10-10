@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -603,12 +604,12 @@ def test_unsupported_snapshot_version_is_rejected_instead_of_guessed() -> None:
         _model_to_session(row)
 
 
-def test_saving_a_v2_row_upgrades_it_to_v3_without_erasing_the_historical_uuid() -> None:
+def test_saving_a_v2_row_upgrades_it_to_v4_without_erasing_the_historical_uuid() -> None:
     session = _model_to_session(make_v2_session_row())
 
     values = _session_values(session)
 
-    assert values['snapshot_version'] == 3
+    assert values['snapshot_version'] == 4
     assert values['remnawave_id'] == PANEL_ID
     # UPDATE не должен трогать историческую колонку: новый код uuid не знает, и
     # запись None стёрла бы единственный аудиторский след доапгрейдной сессии.
@@ -1321,3 +1322,78 @@ async def test_rolled_back_renewal_announces_nothing(runtime_lab):
         await asyncio.sleep(0)
 
     runtime_lab.announce.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quota_closure_removes_access_before_restoring_paid_squads():
+    from app.services.grace_access_runtime import _build_restore_target
+
+    now = datetime.now(UTC)
+    overlay = replace(make_overlay(), until_quota=True, expire_at=datetime(2099, 12, 31, tzinfo=UTC))
+    user = make_panel_user(
+        status=UserStatus.ACTIVE,
+        expire_at=overlay.expire_at,
+        traffic_limit_bytes=overlay.traffic_limit_bytes,
+        squad_uuids=overlay.squad_uuids,
+    )
+    api = FakeRemnawaveApi(user)
+    before = replace(make_expired_snapshot(), status='EXPIRED', expire_at=now - timedelta(days=1))
+    gateway = RemnawaveGracePanelGateway(db=SimpleNamespace(), subscription_id=1)
+    tail = None
+
+    async def remember(value):
+        nonlocal tail
+        tail = value
+
+    async def execute(_query):
+        return SimpleNamespace(scalar_one_or_none=lambda: tail)
+
+    gateway._remember_grace_tail = remember
+    gateway._db.execute = execute
+    from app.services.grace_access_runtime import _panel_user_to_snapshot
+
+    current = _panel_user_to_snapshot(user)
+    target = _build_restore_target(before, now=now, panel_current=current.expire_at)
+    with pytest.raises(GracePanelTransitionPending):
+        await gateway._quota_expiry_closed(api, PANEL_ID, current, target, overlay)
+    assert api.updates == [{'user_id': PANEL_ID, 'expire_at': target.expire_at, 'active_internal_squads': []}]
+    with pytest.raises(GracePanelTransitionPending):
+        await gateway._quota_expiry_closed(api, PANEL_ID, _panel_user_to_snapshot(user), target, overlay)
+    assert len(api.updates) == 1  # A retry must not extend the technical deadline.
+    user.status = UserStatus.EXPIRED
+    assert await gateway._quota_expiry_closed(api, PANEL_ID, _panel_user_to_snapshot(user), target, overlay)
+
+
+@pytest.mark.asyncio
+async def test_restore_metadata_keeps_other_fields_and_uses_compare_and_swap(monkeypatch):
+    from app.external.remnawave_api import TrafficLimitStrategy
+
+    overlay = replace(make_overlay(), until_quota=True, host_uuid='free-host')
+    before = replace(
+        make_expired_snapshot(),
+        selected_hosts_metadata={'selectedHosts': ['paid-host']},
+        traffic_limit_strategy='MONTH',
+    )
+    api = FakeRemnawaveApi(
+        make_panel_user(status=UserStatus.EXPIRED, expire_at=datetime.now(UTC), traffic_limit_bytes=0, squad_uuids=())
+    )
+    api.user.traffic_limit_strategy = TrafficLimitStrategy.NO_RESET
+    api.get_user_metadata = AsyncMock(return_value={'selectedHosts': ['free-host'], 'adminNote': 'preserve'})
+    api.update_user_metadata = AsyncMock()
+    install_fake_api(monkeypatch, api)
+    # The double mirrors the field confirmation returned by the real PATCH.
+    original_update = api.update_user
+
+    async def update(**kwargs):
+        value = await original_update(**kwargs)
+        value.traffic_limit_strategy = kwargs.get('traffic_limit_strategy', value.traffic_limit_strategy)
+        return value
+
+    api.update_user = update
+    await RemnawaveGracePanelGateway().restore_access_settings(PANEL_ID, before, overlay, None)
+    api.update_user_metadata.assert_awaited_once_with(
+        PANEL_ID,
+        {'selectedHosts': ['paid-host'], 'adminNote': 'preserve'},
+        expected={'selectedHosts': ['free-host'], 'adminNote': 'preserve'},
+    )
+    assert api.user.traffic_limit_strategy is TrafficLimitStrategy.MONTH

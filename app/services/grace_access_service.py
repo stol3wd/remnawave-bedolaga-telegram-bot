@@ -72,6 +72,7 @@ class GraceCompletionReason(StrEnum):
     DRAINED = 'drained'
     CONFLICT = 'conflict'
     REVOKED = 'revoked'
+    QUOTA_EXHAUSTED = 'quota_exhausted'
 
 
 class GraceRestoreOutcome(StrEnum):
@@ -115,6 +116,9 @@ class GraceAccessPolicy:
     reconcile_batch_size: int = 200
     external_squad_uuid: str | None = None
     reset_traffic_on_start: bool = False
+    expired_until_quota: bool = False
+    expired_eligible_squad_uuids: tuple[str, ...] = ()
+    expired_host_uuid: str | None = None
 
     def __post_init__(self) -> None:
         if self.duration <= timedelta(0):
@@ -123,6 +127,10 @@ class GraceAccessPolicy:
             raise ValueError('Grace traffic must not be negative')
         if self.reconcile_batch_size < 1:
             raise ValueError('Grace reconcile batch size must be positive')
+        if self.expired_until_quota and (
+            self.traffic_bytes < 1 or not self.expired_eligible_squad_uuids or not self.expired_host_uuid
+        ):
+            raise ValueError('Free access requires a positive quota, eligible squads and a managed host')
 
     def squad_for(self, reason: GraceReason) -> str:
         squad_uuid = self.expired_squad_uuid if reason is GraceReason.EXPIRED else self.limited_squad_uuid
@@ -150,6 +158,7 @@ class GraceBillingState:
     is_free_tariff: bool = False
     user_status: str = 'active'
     grace_suppressed_until: datetime | None = None
+    traffic_limit_strategy: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +178,9 @@ class GracePanelSnapshot:
     external_squad_uuid: str | None = None
     traffic_is_known: bool = True
     last_traffic_reset_at: datetime | None = None
+    traffic_limit_strategy: str | None = None
+    selected_hosts_metadata: dict[str, Any] | None = None
+    host_available: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +194,10 @@ class GracePanelOverlay:
     external_squad_uuid: str | None = None
     # Счётчик расхода обнуляется при выдаче, а лимит равен самой квоте grace.
     reset_used_traffic: bool = False
+    until_quota: bool = False
+    host_uuid: str | None = None
+    traffic_limit_strategy: str | None = None
+    restore_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +214,7 @@ class GraceAccessSession:
     panel_before: GracePanelSnapshot
     overlay: GracePanelOverlay
     started_at: datetime
-    grace_until: datetime
+    grace_until: datetime | None
     updated_at: datetime
     completion_reason: GraceCompletionReason | None = None
     completed_at: datetime | None = None
@@ -224,6 +240,7 @@ class GraceReconcileResult:
     repaired: int = 0
     unchanged: int = 0
     errors: int = 0
+    quota_exhausted: int = 0
 
 
 class GraceSessionStore(Protocol):
@@ -253,6 +270,15 @@ class GracePanelGateway(Protocol):
 
     async def apply_overlay(self, remnawave_id: int, overlay: GracePanelOverlay) -> None:
         pass
+
+    async def restore_access_settings(
+        self,
+        remnawave_id: int,
+        snapshot: GracePanelSnapshot,
+        overlay: GracePanelOverlay,
+        billing: GraceBillingState | None,
+    ) -> None:
+        """Restore quota-owned host selection and reset strategy after access has closed."""
 
     async def restore_snapshot(
         self,
@@ -330,6 +356,8 @@ class GraceAccessService:
         panel_snapshot = await self._panel.read_snapshot(billing.remnawave_id)
         if not panel_snapshot:
             return GraceStartResult(GraceStartDecision.PANEL_USER_NOT_FOUND)
+        if self._policy.expired_until_quota and _normalize_status(panel_snapshot.status) == 'disabled':
+            return GraceStartResult(GraceStartDecision.NOT_ELIGIBLE)
         if not panel_status_matches_reason(panel_snapshot.status, reason):
             logger.warning(
                 'Grace candidate panel status no longer matches incident',
@@ -372,7 +400,7 @@ class GraceAccessService:
             panel_before=panel_snapshot,
             overlay=overlay,
             started_at=now,
-            grace_until=overlay.expire_at,
+            grace_until=None if overlay.until_quota else overlay.expire_at,
             updated_at=now,
         )
         pending_session = await self._store.create(pending_session)
@@ -510,6 +538,8 @@ class GraceAccessService:
                 result = replace(result, revoked=result.revoked + 1)
             elif action == GraceCompletionReason.CONFLICT.value:
                 result = replace(result, conflicts=result.conflicts + 1)
+            elif action == GraceCompletionReason.QUOTA_EXHAUSTED.value:
+                result = replace(result, quota_exhausted=result.quota_exhausted + 1)
             else:
                 result = replace(result, unchanged=result.unchanged + 1)
 
@@ -564,7 +594,7 @@ class GraceAccessService:
             return action[1]
 
         if (
-            now >= _as_utc(session.grace_until)
+            (session.grace_until is not None and now >= _as_utc(session.grace_until))
             or not billing_incident_is_eligible(latest_billing, session.reason)
             or not billing_still_matches_session(session, latest_billing)
         ):
@@ -729,27 +759,41 @@ class GraceAccessService:
             return action
 
         now = _as_utc(self._clock())
+        within_deadline = session.grace_until is None or now < _as_utc(session.grace_until)
         if session.state is GraceSessionState.PENDING:
-            if activate_pending and not force_restore and now < _as_utc(session.grace_until):
+            if activate_pending and not force_restore and within_deadline:
                 activated_session = await self._activate_pending(session)
                 if activated_session.state is GraceSessionState.ACTIVE:
                     return 'activated'
                 return (activated_session.completion_reason or GraceCompletionReason.CONFLICT).value
 
             completion_reason = (
-                GraceCompletionReason.DRAINED
-                if force_restore or now < _as_utc(session.grace_until)
-                else GraceCompletionReason.TIMEOUT
+                GraceCompletionReason.DRAINED if force_restore or within_deadline else GraceCompletionReason.TIMEOUT
             )
             action, _ = await self._restore_and_complete(session, completion_reason)
             return action
 
-        if session.state is GraceSessionState.ACTIVE and not force_restore and now < _as_utc(session.grace_until):
+        if session.state is GraceSessionState.ACTIVE and not force_restore and within_deadline:
             current_panel = await self._panel.read_snapshot(session.remnawave_id)
             if current_panel is None:
                 await self._complete(session, GraceCompletionReason.CONFLICT)
                 return GraceCompletionReason.CONFLICT.value
             if panel_matches_overlay(current_panel, session.overlay, now=now):
+                if session.overlay.until_quota:
+                    if not current_panel.host_available:
+                        action, _ = await self._restore_and_complete(session, GraceCompletionReason.CONFLICT)
+                        return action
+                    # A reset would otherwise refill a one-time grant forever.
+                    if current_panel.used_traffic_bytes < session.panel_before.used_traffic_bytes or (
+                        current_panel.last_traffic_reset_at is not None
+                        and current_panel.last_traffic_reset_at != session.panel_before.last_traffic_reset_at
+                        and _as_utc(current_panel.last_traffic_reset_at) >= _as_utc(session.started_at)
+                    ):
+                        action, _ = await self._restore_and_complete(session, GraceCompletionReason.CONFLICT)
+                        return action
+                    if current_panel.used_traffic_bytes >= session.overlay.traffic_limit_bytes:
+                        action, _ = await self._restore_and_complete(session, GraceCompletionReason.QUOTA_EXHAUSTED)
+                        return action
                 return 'unchanged'
 
             # Any unexpected panel difference can be an emergency/manual
@@ -776,7 +820,13 @@ class GraceAccessService:
             )
             return GraceCompletionReason.CONFLICT.value
 
-        completion_reason = GraceCompletionReason.DRAINED if force_restore else GraceCompletionReason.TIMEOUT
+        completion_reason = (
+            GraceCompletionReason(session.overlay.restore_reason)
+            if session.overlay.restore_reason
+            else GraceCompletionReason.DRAINED
+            if force_restore
+            else GraceCompletionReason.TIMEOUT
+        )
         action, _ = await self._restore_and_complete(session, completion_reason)
         return action
 
@@ -791,6 +841,7 @@ class GraceAccessService:
             restoring_session = replace(
                 session,
                 state=GraceSessionState.RESTORING,
+                overlay=replace(session.overlay, restore_reason=completion_reason.value),
                 updated_at=now,
                 last_error=None,
             )
@@ -843,6 +894,13 @@ class GraceAccessService:
         *,
         last_error: str | None = None,
     ) -> GraceAccessSession:
+        if session.overlay.until_quota:
+            await self._panel.restore_access_settings(
+                session.remnawave_id,
+                session.panel_before,
+                session.overlay,
+                await self._billing.get_subscription(session.subscription_id),
+            )
         now = _as_utc(self._clock())
         completed_session = replace(
             session,
@@ -957,6 +1015,11 @@ def billing_is_eligible(
     policy: GraceAccessPolicy,
 ) -> bool:
     """Apply incident safety and subscription-kind flags to a new grant."""
+    if reason is GraceReason.LIMITED and not policy.limited_squad_uuid:
+        return False
+    if reason is GraceReason.EXPIRED and policy.expired_until_quota:
+        if not set(billing.squad_uuids).intersection(policy.expired_eligible_squad_uuids):
+            return False
     return billing_incident_is_eligible(billing, reason) and policy_allows_subscription(billing, policy)
 
 
@@ -1010,6 +1073,7 @@ def should_reset_used_traffic(
     """
     return (
         policy.reset_traffic_on_start
+        and not policy.expired_until_quota
         and reason is GraceReason.EXPIRED
         and billing.traffic_limit_bytes == 0
         and snapshot.traffic_limit_bytes == 0
@@ -1038,19 +1102,21 @@ def build_panel_overlay(
     else:
         temporary_limit = snapshot.used_traffic_bytes + policy.traffic_bytes
 
-    # Внешний сквад даёт доступ независимо от внутреннего telegram-only сквада,
-    # поэтому grace по умолчанию его отцепляет: иначе ограничение обходится мимо
-    # всей схемы. Значение задаётся админом осознанно — 'keep' сохраняет текущий
-    # (например, со шаблонами под блокировки), UUID подставляет аварийный.
+    # External squads override subscription templates; inbounds are granted only by internal squads.
     external_squad_uuid = _resolve_grace_external_squad(policy.external_squad_uuid, snapshot)
 
+    until_quota = reason is GraceReason.EXPIRED and policy.expired_until_quota
     return GracePanelOverlay(
         status='ACTIVE',
-        expire_at=_as_utc(now) + policy.duration,
+        # Panel requires an expiry; the billing session has no deadline in quota mode.
+        expire_at=datetime(2099, 12, 31, tzinfo=UTC) if until_quota else _as_utc(now) + policy.duration,
         traffic_limit_bytes=temporary_limit,
         squad_uuids=(policy.squad_for(reason),),
         external_squad_uuid=external_squad_uuid,
         reset_used_traffic=reset_used_traffic,
+        until_quota=until_quota,
+        host_uuid=policy.expired_host_uuid if until_quota else None,
+        traffic_limit_strategy='NO_RESET' if until_quota else None,
     )
 
 
@@ -1245,6 +1311,14 @@ def panel_matches_overlay(
         and snapshot.traffic_limit_bytes == overlay.traffic_limit_bytes
         and set(snapshot.squad_uuids) == set(overlay.squad_uuids)
         and snapshot.external_squad_uuid == overlay.external_squad_uuid
+        and (
+            overlay.traffic_limit_strategy is None or snapshot.traffic_limit_strategy == overlay.traffic_limit_strategy
+        )
+        and (
+            overlay.host_uuid is None
+            or snapshot.selected_hosts_metadata is None
+            or snapshot.selected_hosts_metadata == {'selectedHosts': [overlay.host_uuid]}
+        )
     )
 
 

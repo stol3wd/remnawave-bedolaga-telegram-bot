@@ -889,6 +889,14 @@ class EmailNotificationTemplates:
     def _grace_access_email(self, event: str, language: str, context: dict[str, Any]) -> dict[str, str]:
         lang = language if language in ('ru', 'en', 'zh', 'ua') else 'ru'
         subject, body, why_by_reason = self.GRACE_EMAIL_COPY[event][lang]
+        if event == 'granted' and context.get('hours') == 0:
+            body = (
+                '<p>Бесплатный доступ: <strong>{allowed}</strong>, {traffic_gb} ГиБ до расходования квоты. '
+                'Используйте прежнюю ссылку подписки.</p>'
+                if lang == 'ru'
+                else '<p>Free access: <strong>{allowed}</strong>, {traffic_gb} GiB until the quota is used. '
+                'Use your existing subscription link.</p>'
+            )
         tariff_name = str(context.get('tariff_name') or '').strip()
         reason = str(context.get('reason') or 'expired').strip().lower()
         values = {

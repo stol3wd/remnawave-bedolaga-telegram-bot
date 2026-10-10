@@ -34,6 +34,7 @@ from app.database.models import (
     UserStatus as DatabaseUserStatus,
 )
 from app.external.remnawave_api import (
+    TrafficLimitStrategy,
     UserStatus as PanelUserStatus,
     coerce_panel_user_id,
 )
@@ -398,12 +399,52 @@ class RemnawaveGracePanelGateway:
             panel_user = await api.get_user_by_id(remnawave_id)
         if panel_user is None:
             return None
-        return _panel_user_to_snapshot(panel_user)
+        snapshot = _panel_user_to_snapshot(panel_user)
+        quota_row = None
+        if self._db is not None:
+            quota_row = (
+                await self._db.execute(
+                    select(GraceAccessSessionModel)
+                    .where(
+                        GraceAccessSessionModel.remnawave_id == remnawave_id,
+                        GraceAccessSessionModel.state.in_(_OPEN_STATES),
+                        GraceAccessSessionModel.grace_until.is_(None),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA or quota_row is not None:
+            async with remnawave_service.get_api_client() as api:
+                metadata = await api.get_user_metadata(remnawave_id)
+                if quota_row is not None and quota_row.state == GraceSessionState.ACTIVE.value:
+                    from app.external.remnawave_api import RemnaWaveAPIError, RemnaWaveFreeHostError
+
+                    overlay = _model_to_session(quota_row).overlay
+                    try:
+                        await api.validate_free_access_host(
+                            overlay.host_uuid, overlay.squad_uuids[0], require_connected=False
+                        )
+                    except RemnaWaveFreeHostError:
+                        snapshot = replace(snapshot, host_available=False)
+                    except RemnaWaveAPIError as error:
+                        if error.status_code != 404:
+                            raise
+                        snapshot = replace(snapshot, host_available=False)
+            snapshot = replace(
+                snapshot, selected_hosts_metadata={key: metadata[key] for key in ('selectedHosts',) if key in metadata}
+            )
+        return snapshot
 
     async def apply_overlay(self, remnawave_id: int, overlay: GracePanelOverlay) -> None:
         from app.services.remnawave_service import remnawave_service
 
         async with remnawave_service.get_api_client() as api:
+            if overlay.until_quota:
+                await api.validate_free_access_host(overlay.host_uuid, overlay.squad_uuids[0])
+                metadata = await api.get_user_metadata(remnawave_id)
+                await api.update_user_metadata(
+                    remnawave_id, {**metadata, 'selectedHosts': [overlay.host_uuid]}, expected=metadata
+                )
             # Detach an external squad in a standalone preflight PATCH.  The API
             # client may retry A039 without externalSquadUuid; doing this before
             # ACTIVE/expiry changes guarantees such a retry cannot accidentally
@@ -423,9 +464,19 @@ class RemnawaveGracePanelGateway:
                 expire_at=_as_utc(overlay.expire_at),
                 traffic_limit_bytes=overlay.traffic_limit_bytes,
                 active_internal_squads=list(overlay.squad_uuids),
+                traffic_limit_strategy=(
+                    TrafficLimitStrategy(overlay.traffic_limit_strategy) if overlay.traffic_limit_strategy else None
+                ),
             )
+            confirmed = _panel_user_to_snapshot(updated) if updated is not None else None
+            if confirmed is not None and overlay.host_uuid:
+                metadata = await api.get_user_metadata(remnawave_id)
+                confirmed = replace(
+                    confirmed,
+                    selected_hosts_metadata={key: metadata[key] for key in ('selectedHosts',) if key in metadata},
+                )
             if updated is None or not panel_matches_overlay(
-                _panel_user_to_snapshot(updated),
+                confirmed,
                 overlay,
                 now=datetime.now(UTC),
             ):
@@ -437,6 +488,36 @@ class RemnawaveGracePanelGateway:
                 reset = await api.reset_user_traffic(remnawave_id)
                 if reset is None or int(reset.used_traffic_bytes or 0) >= overlay.traffic_limit_bytes:
                     raise GracePanelError('Remnawave did not reset used traffic for the grace overlay')
+
+    async def restore_access_settings(
+        self,
+        remnawave_id: int,
+        snapshot: GracePanelSnapshot,
+        overlay: GracePanelOverlay,
+        billing: GraceBillingState | None,
+    ) -> None:
+        from app.services.remnawave_service import remnawave_service
+
+        async with remnawave_service.get_api_client() as api:
+            current = await api.get_user_by_id(remnawave_id)
+            if current is None:
+                return
+            metadata = await api.get_user_metadata(remnawave_id)
+            if metadata.get('selectedHosts') == [overlay.host_uuid] and snapshot.selected_hosts_metadata is not None:
+                expected_metadata = dict(metadata)
+                if 'selectedHosts' in snapshot.selected_hosts_metadata:
+                    metadata['selectedHosts'] = snapshot.selected_hosts_metadata['selectedHosts']
+                else:
+                    metadata.pop('selectedHosts', None)
+                await api.update_user_metadata(remnawave_id, metadata, expected=expected_metadata)
+            strategy = billing.traffic_limit_strategy if billing else snapshot.traffic_limit_strategy
+            if strategy and _normalize(current.traffic_limit_strategy) == 'no_reset':
+                updated = await api.update_user(
+                    user_id=remnawave_id,
+                    traffic_limit_strategy=TrafficLimitStrategy(strategy),
+                )
+                if _normalize(updated.traffic_limit_strategy) != strategy.lower():
+                    raise GracePanelError('Remnawave did not restore the traffic reset strategy')
 
     async def restore_snapshot(
         self,
@@ -517,6 +598,44 @@ class RemnawaveGracePanelGateway:
                 return GraceRestoreOutcome.CONFLICT
         raise GracePanelError('Remnawave restore PATCH could not be verified')
 
+    async def _quota_expiry_closed(
+        self,
+        api: Any,
+        remnawave_id: int,
+        current: GracePanelSnapshot,
+        target: _PanelTarget,
+        overlay: GracePanelOverlay,
+    ) -> bool:
+        """Isolate access before the panel derives EXPIRED; never expose paid inbounds in the meantime."""
+        if not overlay.until_quota:
+            return False
+        if current.status.lower() == 'disabled':
+            raise GracePanelTransitionConflict('Administrative disable takes precedence over free access')
+        tail = None
+        if self._db is not None and self._subscription_id is not None:
+            tail = (
+                await self._db.execute(
+                    select(Subscription.grace_tail_expire_at).where(
+                        Subscription.id == self._subscription_id,
+                    )
+                )
+            ).scalar_one_or_none()
+        ours = (
+            not current.squad_uuids
+            and current.expire_at is not None
+            and tail is not None
+            and abs((_as_utc(current.expire_at) - _as_utc(tail)).total_seconds()) <= 2
+        )
+        if ours and current.status.lower() == 'expired':
+            return True
+        if not ours:
+            if not panel_matches_overlay(current, overlay, now=datetime.now(UTC)):
+                return False
+            closing_at = target.expire_at or current.expire_at
+            await self._remember_grace_tail(closing_at)
+            await api.update_user(user_id=remnawave_id, expire_at=closing_at, active_internal_squads=[])
+        raise GracePanelTransitionPending('Free access is isolated while the panel derives EXPIRED')
+
     async def _restore_expired_target(
         self,
         api: Any,
@@ -536,14 +655,19 @@ class RemnawaveGracePanelGateway:
         Пока панель держит аккаунт ACTIVE с уже прошедшей (или погашенной нами)
         датой, сессия остаётся RESTORING и доводится следующим проходом.
         """
+        quota_closed = await self._quota_expiry_closed(api, remnawave_id, current, target, expected_overlay)
         if _expired_transition_is_pending(current, target, now=now):
             raise GracePanelTransitionPending(
                 'Remnawave has not expired the account yet; canonical fields are in place'
             )
-        if not panel_matches_overlay(current, expected_overlay, now=now) and not panel_is_safe_pending_source(
-            current,
-            snapshot,
-            expected_overlay,
+        if (
+            not quota_closed
+            and not panel_matches_overlay(current, expected_overlay, now=now)
+            and not panel_is_safe_pending_source(
+                current,
+                snapshot,
+                expected_overlay,
+            )
         ):
             return GraceRestoreOutcome.CONFLICT
 
@@ -644,6 +768,7 @@ class RemnawaveGracePanelGateway:
             raise GracePanelTransitionConflict('Canonical Remnawave user disappeared during EXPIRED restore')
         current = _panel_user_to_snapshot(current_user)
         target = _build_billing_target(billing, now=now, panel_current=current.expire_at)
+        quota_closed = await self._quota_expiry_closed(api, billing.remnawave_id, current, target, expected_overlay)
         if _panel_matches_target(current, target) and _panel_user_matches_device_limit(current_user, target):
             return
         if _expired_transition_is_pending(current, target, now=now) and _panel_user_matches_device_limit(
@@ -652,7 +777,7 @@ class RemnawaveGracePanelGateway:
             raise GracePanelTransitionPending(
                 'Remnawave has not expired the account yet; canonical fields are in place'
             )
-        if not _expired_transition_source_is_safe(current, target, expected_overlay, now=now):
+        if not quota_closed and not _expired_transition_source_is_safe(current, target, expected_overlay, now=now):
             raise GracePanelTransitionConflict(
                 'Remnawave changed outside grace; canonical EXPIRED state was not applied'
             )
@@ -866,7 +991,14 @@ class GraceAccessRuntime:
     async def _announce_reconcile(self, subscription_id: int, result: GraceReconcileResult) -> None:
         if result.activated:
             await announce_grace_event(self.bot, subscription_id, 'granted')
-        elif result.paid or result.timed_out or result.drained or result.revoked or result.conflicts:
+        elif (
+            result.paid
+            or result.timed_out
+            or result.drained
+            or result.revoked
+            or result.conflicts
+            or result.quota_exhausted
+        ):
             await announce_grace_event(self.bot, subscription_id, 'ended')
 
     async def should_suppress_webhook(
@@ -988,7 +1120,8 @@ class GraceAccessRuntime:
         policy = _build_policy()
 
         expired_recently = and_(
-            Subscription.end_date >= cutoff,
+            Subscription.end_date
+            >= (datetime(1970, 1, 1, tzinfo=UTC) if settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA else cutoff),
             Subscription.end_date <= now,
             Subscription.status.in_(
                 (
@@ -1785,6 +1918,11 @@ def _build_policy() -> GraceAccessPolicy:
         reconcile_batch_size=settings.GRACE_ACCESS_RECONCILE_BATCH_SIZE,
         external_squad_uuid=settings.GRACE_ACCESS_EXTERNAL_SQUAD_UUID.strip() or None,
         reset_traffic_on_start=settings.GRACE_ACCESS_RESET_TRAFFIC_ON_START,
+        expired_until_quota=settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA,
+        expired_eligible_squad_uuids=tuple(
+            value.strip() for value in settings.GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS.split(',') if value.strip()
+        ),
+        expired_host_uuid=settings.GRACE_ACCESS_EXPIRED_HOST_UUID.strip() or None,
     )
 
 
@@ -1795,12 +1933,22 @@ def _validate_active_configuration() -> None:
         ('GRACE_ACCESS_EXPIRED_SQUAD_UUID', settings.GRACE_ACCESS_EXPIRED_SQUAD_UUID),
         ('GRACE_ACCESS_LIMITED_SQUAD_UUID', settings.GRACE_ACCESS_LIMITED_SQUAD_UUID),
     ):
+        if (
+            label == 'GRACE_ACCESS_LIMITED_SQUAD_UUID'
+            and not raw_uuid.strip()
+            and settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA
+        ):
+            continue
         if not raw_uuid.strip():
             raise ValueError(f'{label} is required when GRACE_ACCESS_MODE=true')
         try:
             UUID(raw_uuid.strip())
         except ValueError as error:
             raise ValueError(f'{label} must contain a valid UUID') from error
+    if settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA:
+        policy = _build_policy()
+        for value in (*policy.expired_eligible_squad_uuids, policy.expired_host_uuid):
+            UUID(value)
 
 
 async def collect_grace_status(db: AsyncSession, *, error_limit: int = 20) -> dict[str, Any]:
@@ -1898,6 +2046,8 @@ async def _acquire_database_lock(db: AsyncSession, subscription_id: int) -> None
 
 
 def _subscription_to_billing(subscription: Subscription) -> GraceBillingState:
+    from app.services.subscription_service import get_traffic_reset_strategy
+
     user = subscription.user
     tariff = subscription.tariff
     remnawave_id = subscription.remnawave_id if settings.is_multi_tariff_enabled() else user.remnawave_id
@@ -1920,6 +2070,7 @@ def _subscription_to_billing(subscription: Subscription) -> GraceBillingState:
         grace_suppressed_until=(
             _as_utc(subscription.grace_suppressed_until) if subscription.grace_suppressed_until else None
         ),
+        traffic_limit_strategy=get_traffic_reset_strategy(tariff).value,
     )
 
 
@@ -1936,6 +2087,13 @@ def _panel_user_to_snapshot(panel_user: Any) -> GracePanelSnapshot:
         external_squad_uuid=panel_user.external_squad_uuid,
         traffic_is_known=panel_user.user_traffic is not None,
         last_traffic_reset_at=(_as_utc(panel_user.last_traffic_reset_at) if panel_user.last_traffic_reset_at else None),
+        traffic_limit_strategy=(
+            getattr(
+                getattr(panel_user, 'traffic_limit_strategy', None),
+                'value',
+                getattr(panel_user, 'traffic_limit_strategy', None),
+            )
+        ),
     )
 
 
@@ -2262,6 +2420,7 @@ def _merge_reconcile_results(
         repaired=left.repaired + right.repaired,
         unchanged=left.unchanged + right.unchanged,
         errors=left.errors + right.errors,
+        quota_exhausted=left.quota_exhausted + right.quota_exhausted,
     )
 
 

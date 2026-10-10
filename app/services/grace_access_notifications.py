@@ -35,13 +35,13 @@ GraceEvent = Literal['granted', 'ended']
 _GIB = 1024**3
 #: О продлении человек уже получает своё уведомление; отзыв и конфликт — служебные
 #: исходы, человеку о них сказать нечего. Ему сообщаем только «доступ закрылся».
-_USER_ENDED_REASONS = frozenset({'timeout', 'drained'})
+_USER_ENDED_REASONS = frozenset({'timeout', 'drained', 'quota_exhausted'})
 
 
 @dataclass(frozen=True, slots=True)
 class _GraceDetails:
     reason: str
-    grace_until: datetime
+    grace_until: datetime | None
     hours: int
     quota_gb: float
     completion_reason: str | None
@@ -101,11 +101,11 @@ def _details(row: GraceAccessSessionModel) -> _GraceDetails:
     limit = int(overlay.get('traffic_limit_bytes') or 0)
     used = int(before.get('used_traffic_bytes') or 0)
     quota_gb = max(0.0, (limit - used) / _GIB)
-    grace_until = _as_utc(row.grace_until)
+    grace_until = _as_utc(row.grace_until) if row.grace_until else None
     started_at = _as_utc(row.started_at) if row.started_at else grace_until
     hours = (
         max(1, round((grace_until - started_at).total_seconds() / 3600))
-        if row.started_at
+        if row.started_at and grace_until
         else int(settings.GRACE_ACCESS_DURATION_HOURS)
     )
     return _GraceDetails(
@@ -155,6 +155,14 @@ async def _notify_user(bot: Any, event: GraceEvent, subscription: Subscription, 
         text_key = 'GRACE_ACCESS_ENDED'
         notification_type = NotificationType.GRACE_ACCESS_ENDED
     template = texts.get(text_key)
+    if event == 'granted' and details.grace_until is None:
+        template = (
+            '🛟 Подписка истекла. Доступ к {allowed}: {traffic_gb} ГиБ до расходования квоты. '
+            'Конфиг доступен по прежней ссылке подписки.'
+            if user.language == 'ru'
+            else '🛟 Subscription expired. Access to {allowed}: {traffic_gb} GiB until the quota is used. '
+            'Use your existing subscription link.'
+        )
     if not template:
         logger.warning('Missing locale key for grace notification', text_key=text_key, language=user.language)
         return
@@ -171,7 +179,11 @@ async def _notify_user(bot: Any, event: GraceEvent, subscription: Subscription, 
         'allowed': allowed,
         'hours': details.hours,
         'traffic_gb': f'{details.quota_gb:g}',
-        'until': format_local_datetime(details.grace_until, '%d.%m.%Y %H:%M'),
+        'until': (
+            format_local_datetime(details.grace_until, '%d.%m.%Y %H:%M')
+            if details.grace_until
+            else 'до расходования квоты'
+        ),
     }
     message = template.format(**context)
     # Письму — сырые значения: его шаблон экранирует сам, а редактор писем
@@ -179,7 +191,7 @@ async def _notify_user(bot: Any, event: GraceEvent, subscription: Subscription, 
     email_context = {
         'text_key': text_key,
         'allowed': grace_allowed_services(),
-        'hours': details.hours,
+        'hours': details.hours if details.grace_until else 0,
         'traffic_gb': f'{details.quota_gb:g}',
         'until': context['until'],
         'reason': details.reason,

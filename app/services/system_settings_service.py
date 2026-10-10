@@ -861,6 +861,18 @@ class BotConfigurationService:
             ),
             'dependencies': 'GRACE_ACCESS_TRAFFIC_GB',
         },
+        'GRACE_ACCESS_EXPIRED_UNTIL_QUOTA': {
+            'description': 'Бесплатный доступ после истечения подписки до расходования разовой квоты, без срока.',
+            'warning': 'Для выбранных исходных сквадов; счётчик не сбрасывается, дата оплаченной подписки сохраняется.',
+        },
+        'GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS': {
+            'description': 'UUID исходных платных Internal Squads, которым разрешён бесплатный доступ.',
+            'format': 'UUID через запятую. Пустое значение запрещает выдачу в режиме без срока.',
+        },
+        'GRACE_ACCESS_EXPIRED_HOST_UUID': {
+            'description': 'UUID управляемого VLESS Host для бесплатного доступа.',
+            'warning': 'Host должен быть включён, его inbound — в бесплатном скваде и активен на ноде.',
+        },
         'GRACE_ACCESS_DURATION_HOURS': {
             'description': 'Сколько действует grace-доступ, если подписку так и не продлили.',
             'format': 'Целое число часов.',

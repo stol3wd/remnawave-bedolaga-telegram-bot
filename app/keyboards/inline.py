@@ -1125,6 +1125,22 @@ def get_subscription_keyboard(
     )
 
     if has_subscription:
+        if (
+            subscription
+            and subscription.actual_status == 'expired'
+            and settings.GRACE_ACCESS_EXPIRED_UNTIL_QUOTA
+            and set(subscription.connected_squads or []).intersection(
+                item.strip() for item in settings.GRACE_ACCESS_EXPIRED_ELIGIBLE_SQUAD_UUIDS.split(',')
+            )
+        ):
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text=texts.t('FREE_ACCESS_CONNECT', '🛟 Бесплатный конфиг'),
+                        callback_data=f'free_access_connect:{subscription.id}',
+                    )
+                ]
+            )
         subscription_link = get_display_subscription_link(subscription) if subscription else None
         if subscription_link:
             connect_mode = settings.CONNECT_BUTTON_MODE
